@@ -1,12 +1,17 @@
 package com.yahoo.imapnio.client;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.TooLongFrameException;
 
 /**
  * Unit test for {@link ImapClientRespReader}.
@@ -327,5 +332,200 @@ public class ImapClientRespReaderTest {
         final String result2 = resultBuf4.toString(StandardCharsets.US_ASCII);
         Assert.assertEquals(result2, ", and here u go with CRLF!\r\n", "decode() result mismatched.");
 
+    }
+
+    /**
+     * Feeds the input to a reader in one buffer and collects the frames it produces.
+     *
+     * @param input the bytes the server sends, as US-ASCII
+     * @return the frames, in order
+     */
+    private List<String> decodeFrames(final String input) {
+        final EmbeddedChannel channel = new EmbeddedChannel(new ImapClientRespReader(Integer.MAX_VALUE));
+        channel.writeInbound(Unpooled.copiedBuffer(input, StandardCharsets.US_ASCII));
+        return readFrames(channel);
+    }
+
+    /**
+     * Collects the frames the reader has produced, then closes the channel.
+     *
+     * @param channel the channel holding the reader
+     * @return the frames, in order
+     */
+    private List<String> readFrames(final EmbeddedChannel channel) {
+        final List<String> frames = new ArrayList<String>();
+        ByteBuf frame = channel.readInbound();
+        while (frame != null) {
+            frames.add(frame.toString(StandardCharsets.US_ASCII));
+            frame.release();
+            frame = channel.readInbound();
+        }
+        channel.finishAndReleaseAll();
+        return frames;
+    }
+
+    /**
+     * Tests that a folder name ending in {n} in the text of an untagged NO response does not open a literal, so the responses after it stay
+     * separate.
+     */
+    @Test
+    public void testStatusTextEndingInBracedCountIsNotLiteral() {
+        final List<String> expected = Arrays.asList("* LIST () \"/\" \"Lists/Team{36}\"\r\n",
+                "* NO Mailbox doesn't exist: Lists/Team{36}\r\n", "* LIST () \"/\" \"Lists/Other\"\r\n",
+                "* STATUS \"Lists/Other\" (MESSAGES 3 UNSEEN 1)\r\n", "a3 OK List completed.\r\n");
+        Assert.assertEquals(decodeFrames(String.join("", expected)), expected, "Each response should be its own frame.");
+    }
+
+    /**
+     * Tests that tagged, lower-case and continuation responses whose text ends in a braced count, even after a space, do not open a literal.
+     */
+    @Test
+    public void testStatusAndContinuationTextIsNotLiteral() {
+        final List<String> expected = Arrays.asList("a1 OK done {5}\r\n", "* no such folder {5}\r\n", "* BYE {5}\r\n",
+                "+ go ahead {5}\r\n", "* OK [ALERT] see {5}\r\n", "a2 OK\r\n");
+        Assert.assertEquals(decodeFrames(String.join("", expected)), expected, "Each response should be its own frame.");
+    }
+
+    /**
+     * Tests that a capability atom ending in {n} does not open a literal, so the tagged completion is framed instead of awaited as literal data.
+     */
+    @Test
+    public void testBraceAfterAtomCharIsNotLiteral() {
+        final List<String> expected = Arrays.asList("* CAPABILITY IMAP4rev1 IDLE X-VENDOR{28}\r\n", "a1 OK CAPABILITY completed\r\n");
+        Assert.assertEquals(decodeFrames(String.join("", expected)), expected, "Each response should be its own frame.");
+    }
+
+    /**
+     * Tests braced counts that are not literals: at the start of a line, with no digits, a "~" with nothing before it, after a "~" that follows an
+     * atom char, a count beyond int range, a line ending in a bare LF, and a "~" or "{n}" that more text follows.
+     */
+    @Test
+    public void testMalformedBracedCountIsNotLiteral() {
+        final List<String> expected = Arrays.asList("{3}\r\n", "* LIST () \"/\" {}\r\n", "~{3}\r\n", "* 1 FETCH (BINARY[1] x~{3}\r\n",
+                "* 1 FETCH (BODY[] {99999999999}\r\n", "* 1 FETCH (BODY[] {3}\n", "* 1 FETCH (X ~y {3} Z)\r\n", "a1 OK\r\n");
+        Assert.assertEquals(decodeFrames(String.join("", expected)), expected, "Each line should be its own frame.");
+    }
+
+    /**
+     * Tests that literals in the positions the grammar allows still frame with their data: after "(", a literal8 after SP, a literal in an
+     * untagged response whose name only starts like a status word, and a literal inside a BADCHARSET response code that continues past it.
+     */
+    @Test
+    public void testLiteralsWhereGrammarAllowsThem() {
+        final List<String> expected = Arrays.asList("* 1 FETCH (BODY[HEADER.FIELDS ({7}\r\nSUBJECT)] \"x\")\r\n",
+                "* 2 FETCH (BINARY[1] ~{3}\r\nabc)\r\n", "* OKAY {2}\r\nab\r\n",
+                "* NO [BADCHARSET (\"a]\\\"b\" {5}\r\nUTF-8 {3}\r\nabc)] unsupported {3}\r\n", "a1 OK\r\n");
+        Assert.assertEquals(decodeFrames(String.join("", expected)), expected, "Each response should be one frame with its literals.");
+    }
+
+    /**
+     * Tests folder names containing {n}: quoted in LIST and STATUS, and echoed unquoted in status text even after a space, are not literals, while
+     * the same name sent as a literal still frames with its data.
+     */
+    @Test
+    public void testFolderNamesContainingBracedCount() {
+        final List<String> expected = Arrays.asList("* LIST () \"/\" \"x{28}\"\r\n", "* LIST () \"/\" \"Lists/a {28}\"\r\n",
+                "* STATUS \"a {28}\" (MESSAGES 1)\r\n", "* NO Mailbox doesn't exist: Lists/a {28}\r\n",
+                "a1 NO [NONEXISTENT] Unknown folder: {28}\r\n", "* LIST () \"/\" {6}\r\na {28}\r\n", "a2 OK LIST completed\r\n");
+        Assert.assertEquals(decodeFrames(String.join("", expected)), expected, "Each response should be its own frame.");
+    }
+
+    /**
+     * Tests that a literal announcing the largest int count is buffered without allocating that much up front, and waits for its bytes.
+     */
+    @Test
+    public void testHugeLiteralCountIsNotPreallocated() {
+        final EmbeddedChannel channel = new EmbeddedChannel(new ImapClientRespReader(Integer.MAX_VALUE));
+        channel.writeInbound(Unpooled.copiedBuffer("* 1 FETCH (BODY[] {2147483647}\r\nabc", StandardCharsets.US_ASCII));
+        final Object frame = channel.readInbound();
+        final boolean open = channel.isOpen();
+        channel.finishAndReleaseAll();
+        Assert.assertNull(frame, "No frame should be produced before the literal bytes arrive.");
+        Assert.assertTrue(open, "The channel should stay open.");
+    }
+
+    /**
+     * Tests that an unbalanced quote in a data response, as a server that does not escape a quote inside a string would send, does not hide the
+     * literal that ends the line.
+     */
+    @Test
+    public void testUnbalancedQuoteInDataResponseKeepsLiteral() {
+        final List<String> expected = Arrays.asList("* 1 FETCH (X \"a\"b\" BODY[] {3}\r\nabc)\r\n", "a1 OK\r\n");
+        Assert.assertEquals(decodeFrames(String.join("", expected)), expected, "The response should be one frame with its literal.");
+    }
+
+    /**
+     * Tests that a braced count right after the "[" that opens a response code is not a literal, since a code starts with an atom.
+     */
+    @Test
+    public void testBraceRightAfterRespCodeOpenIsNotLiteral() {
+        final List<String> expected = Arrays.asList("* OK [{5}\r\n", "a1 OK\r\n");
+        Assert.assertEquals(decodeFrames(String.join("", expected)), expected, "Each line should be its own frame.");
+    }
+
+    /**
+     * Tests that a braced count in a response code other than BADCHARSET is not a literal, even when the code is not closed on its line, and that a
+     * lower-case BADCHARSET code still carries one.
+     */
+    @Test
+    public void testOnlyBadCharsetCodeCarriesLiteral() {
+        final List<String> expected = Arrays.asList("a1 OK [)x0(% {7}\r\n", "* OK [CAPABILITY IMAP4rev1 X {28}\r\n", "* OK [UIDVALIDITY 3] x {5}\r\n",
+                "a2 NO [ALERT\r\n", "* NO [badcharset ({5}\r\nUTF-8)] unsupported\r\n", "a3 OK\r\n");
+        Assert.assertEquals(decodeFrames(String.join("", expected)), expected, "Each response should be its own frame.");
+    }
+
+    /**
+     * Tests that responses arriving one byte per read frame the same as in one read, so the scan resumes where the last read stopped.
+     */
+    @Test
+    public void testResponsesSplitIntoSingleByteReads() {
+        final List<String> expected = Arrays.asList("* NO [BADCHARSET ({5}\r\nUTF-8)] unsupported\r\n", "* 1 FETCH (BODY[] ~{3}\r\nabc)\r\n",
+                "* NO Mailbox doesn't exist: Lists/Team{5}\r\n", "a1 OK\r\n");
+        final EmbeddedChannel channel = new EmbeddedChannel(new ImapClientRespReader(Integer.MAX_VALUE));
+        final byte[] input = String.join("", expected).getBytes(StandardCharsets.US_ASCII);
+        for (final byte b : input) {
+            channel.writeInbound(Unpooled.wrappedBuffer(new byte[] { b }));
+        }
+        Assert.assertEquals(readFrames(channel), expected, "Each response should be its own frame.");
+    }
+
+    /**
+     * Tests that a line longer than the maximum, with its end in the same read, fails the read and the responses after it are still framed.
+     */
+    @Test
+    public void testTooLongLineWithItsEndFails() {
+        final EmbeddedChannel channel = new EmbeddedChannel(new ImapClientRespReader(8));
+        final TooLongFrameException e = Assert.expectThrows(TooLongFrameException.class,
+                () -> channel.writeInbound(Unpooled.copiedBuffer("a1 123456789\r\nb1 OK\r\n", StandardCharsets.US_ASCII)));
+        Assert.assertEquals(e.getMessage(), "frame length (12) exceeds the allowed maximum (8)", "Exception message mismatched.");
+        channel.writeInbound(Unpooled.copiedBuffer("c1 OK\r\n", StandardCharsets.US_ASCII));
+        Assert.assertEquals(readFrames(channel), Arrays.asList("b1 OK\r\n", "c1 OK\r\n"), "The responses after the long line should be framed.");
+    }
+
+    /**
+     * Tests that a line longer than the maximum after a literal drops the whole response, literal included.
+     */
+    @Test
+    public void testTooLongLineAfterLiteralDropsResponse() {
+        final EmbeddedChannel channel = new EmbeddedChannel(new ImapClientRespReader(8));
+        final TooLongFrameException e = Assert.expectThrows(TooLongFrameException.class,
+                () -> channel.writeInbound(Unpooled.copiedBuffer("* X {2}\r\nxy 123456789\r\n", StandardCharsets.US_ASCII)));
+        Assert.assertEquals(e.getMessage(), "frame length (10) exceeds the allowed maximum (8)", "Exception message mismatched.");
+        channel.writeInbound(Unpooled.copiedBuffer("b1 OK\r\n", StandardCharsets.US_ASCII));
+        Assert.assertEquals(readFrames(channel), Arrays.asList("b1 OK\r\n"), "Only the response after the dropped one should be framed.");
+    }
+
+    /**
+     * Tests that a line exceeding the maximum before its end arrives fails the read once, and the rest of it is skipped up to its end.
+     */
+    @Test
+    public void testTooLongLineWithoutItsEndIsSkipped() {
+        final EmbeddedChannel channel = new EmbeddedChannel(new ImapClientRespReader(8));
+        final TooLongFrameException e = Assert.expectThrows(TooLongFrameException.class,
+                () -> channel.writeInbound(Unpooled.copiedBuffer("a1 123456789", StandardCharsets.US_ASCII)));
+        Assert.assertEquals(e.getMessage(), "frame length (12) exceeds the allowed maximum (8)", "Exception message mismatched.");
+        channel.writeInbound(Unpooled.copiedBuffer("still a1", StandardCharsets.US_ASCII));
+        channel.writeInbound(Unpooled.copiedBuffer(" more\r\nb1 OK\r\n", StandardCharsets.US_ASCII));
+        Assert.assertEquals(readFrames(channel), Arrays.asList("b1 OK\r\n"), "Only the response after the long line should be framed.");
     }
 }
